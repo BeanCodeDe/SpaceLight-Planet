@@ -5,6 +5,5 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	ackHandler := NewAckHandler(server)
-	server.AddHandler(topic_ack, ackHandler)
+	server.StartServer()
 }

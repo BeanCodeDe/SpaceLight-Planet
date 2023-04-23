@@ -12,7 +12,8 @@ import (
 const (
 	lag_process_time = 200
 	lag_receive_time = 1000
-	lag_player       = 5000
+	leave_player     = 5000
+	lag_player       = 1000
 )
 
 type (
@@ -20,20 +21,41 @@ type (
 		HandleMessage(*DataMessage)
 	}
 
+	PlayerEventHandler interface {
+		HandleEvent(uuid.UUID)
+	}
+
 	Server interface {
+		StartServer()
 		CloseServer()
 		AddHandler(topic string, handler Handler)
+		SetPlayerConnectHandler(handler PlayerEventHandler)
+		SetPlayerLagHandler(handler PlayerEventHandler)
+		SetPlayerLeaveHandler(handler PlayerEventHandler)
 		SendToEveryone(dataMessage *DataMessage) error
 		SendToPlayer(playerId uuid.UUID, dataMessage *DataMessage) error
 	}
 
 	PlanetServer struct {
-		isClosed           bool
-		udpServer          net.PacketConn
+		isClosed             bool
+		udpServer            net.PacketConn
+		playerConnectHandler chan uuid.UUID
+		playerLagHandler     chan uuid.UUID
+		playerLeaveHandler   chan uuid.UUID
+		messageHandler       map[string]chan *DataMessage
+		players              map[uuid.UUID]*player
+
 		receiveMessageChan chan *receivedMessage
-		ackHandler         chan *DataMessage
-		messageHandler     map[string]chan *DataMessage
-		players            map[uuid.UUID]*player
+		receivedMessageIds map[uuid.UUID]bool
+
+		ackData *ackData
+	}
+
+	sendMessage struct {
+		sendToPlayer uuid.UUID
+		lastRetry    time.Time
+		retries      int
+		dataMessage  *DataMessage
 	}
 
 	player struct {
@@ -64,15 +86,28 @@ func NewServer() (Server, error) {
 		return nil, fmt.Errorf("an error aaccourd while creating udp server: %v", err)
 	}
 	server := &PlanetServer{
-		isClosed:           false,
-		udpServer:          udpServer,
+		isClosed:             false,
+		udpServer:            udpServer,
+		playerConnectHandler: make(chan uuid.UUID),
+		playerLagHandler:     make(chan uuid.UUID),
+		playerLeaveHandler:   make(chan uuid.UUID),
+		messageHandler:       make(map[string]chan *DataMessage),
+		players:              make(map[uuid.UUID]*player),
+
 		receiveMessageChan: make(chan *receivedMessage),
-		messageHandler:     make(map[string]chan *DataMessage),
+		receivedMessageIds: make(map[uuid.UUID]bool),
+
+		ackData: newAckData(),
 	}
-	go server.checkInactivePlayer()
-	go server.readIncomingRequests()
-	go server.processIncomingRequests()
 	return server, nil
+}
+
+func (server *PlanetServer) StartServer() {
+	go server.startAckHandle()
+	go server.startAckWatcher()
+	go server.checkInactivePlayer()
+	go server.processIncomingRequests()
+	go server.readIncomingRequests()
 }
 
 func (server *PlanetServer) CloseServer() {
@@ -95,15 +130,37 @@ func (server *PlanetServer) startHandler(dataMessageChan chan *DataMessage, hand
 	}()
 }
 
+func (server *PlanetServer) SetPlayerConnectHandler(handler PlayerEventHandler) {
+	server.startPlayerEventHandler(server.playerConnectHandler, handler)
+}
+func (server *PlanetServer) SetPlayerLagHandler(handler PlayerEventHandler) {
+	server.startPlayerEventHandler(server.playerLagHandler, handler)
+}
+func (server *PlanetServer) SetPlayerLeaveHandler(handler PlayerEventHandler) {
+	server.startPlayerEventHandler(server.playerLeaveHandler, handler)
+}
+
+func (server *PlanetServer) startPlayerEventHandler(playerIdChan chan uuid.UUID, handler PlayerEventHandler) {
+	go func() {
+		for !server.isClosed {
+			playerId := <-playerIdChan
+			handler.HandleEvent(playerId)
+		}
+	}()
+}
+
 func (server *PlanetServer) checkInactivePlayer() {
 	for !server.isClosed {
 		currentTime := time.Now()
 		for index, player := range server.players {
 			lastMessageDuration := currentTime.Sub(player.lastReceivedMessage)
-			if lastMessageDuration.Milliseconds() > lag_player {
-				//TODO player lagging handler
+			if lastMessageDuration.Milliseconds() > leave_player {
+				server.playerLeaveHandler <- index
 				fmt.Printf("Player %v didn't send message since %dms and will be deleted", index, lastMessageDuration.Milliseconds())
 				server.players[index] = nil
+			} else if lastMessageDuration.Milliseconds() > lag_player {
+				server.playerLagHandler <- index
+				fmt.Printf("Player %v didn't send message since %dms and is lagging", index, lastMessageDuration.Milliseconds())
 			}
 		}
 	}
@@ -130,6 +187,11 @@ func (server *PlanetServer) processIncomingRequests() {
 			continue
 		}
 
+		if server.receivedMessageIds[dataMessage.Id] {
+			fmt.Printf("Message already recived: %v", dataMessage.Id)
+			continue
+		}
+
 		if err := server.validateLag(dataMessage.SendTime, receivedMessage.time); err != nil {
 			fmt.Printf("Error while validating lag: %v", err)
 			continue
@@ -139,10 +201,14 @@ func (server *PlanetServer) processIncomingRequests() {
 			fmt.Printf("Error while validating token: %v", err)
 			continue
 		}
+		server.receivedMessageIds[dataMessage.Id] = true
+		if server.players[dataMessage.PlayerId] == nil {
+			server.playerConnectHandler <- dataMessage.PlayerId
+		}
 		server.players[dataMessage.PlayerId] = &player{addr: receivedMessage.sender, lastReceivedMessage: time.Now()}
 
 		if dataMessage.NeedAck {
-			server.ackHandler <- dataMessage
+			server.ackData.ackHandlerChan <- dataMessage
 		}
 
 		handler := server.messageHandler[dataMessage.Topic]
@@ -182,6 +248,9 @@ func (server *PlanetServer) SendToPlayer(playerId uuid.UUID, dataMessage *DataMe
 	if err != nil {
 		return fmt.Errorf("error while parsing data to send: %v", err)
 	}
+	if dataMessage.NeedAck {
+		server.addWaitForAckMessage(playerId, dataMessage)
+	}
 	return server.sendMessage(player.addr, data)
 }
 
@@ -190,7 +259,11 @@ func (server *PlanetServer) SendToEveryone(dataMessage *DataMessage) error {
 	if err != nil {
 		return fmt.Errorf("error while parsing data to send: %v", err)
 	}
-	for _, player := range server.players {
+
+	for playerId, player := range server.players {
+		if dataMessage.NeedAck {
+			server.addWaitForAckMessage(playerId, dataMessage)
+		}
 		if err := server.sendMessage(player.addr, data); err != nil {
 			return err
 		}
