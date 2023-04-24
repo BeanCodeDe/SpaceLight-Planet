@@ -8,39 +8,39 @@ import (
 	"github.com/google/uuid"
 )
 
-func (server *PlanetServer) SendToPlayer(playerId uuid.UUID, dataMessage *DataMessage) error {
-	player := server.players[playerId]
-	if player == nil {
-		return fmt.Errorf("player [%v] not found", playerId)
+func (server *UdpServer) SendToClient(clientId uuid.UUID, dataMessage *DataMessage) error {
+	client := server.clients[clientId]
+	if client == nil {
+		return fmt.Errorf("client [%v] not found", clientId)
 	}
 	data, err := json.Marshal(dataMessage)
 	if err != nil {
 		return fmt.Errorf("error while parsing data to send: %v", err)
 	}
 	if dataMessage.NeedAck {
-		server.addWaitForAckMessage(playerId, dataMessage)
+		server.addWaitForAckMessage(clientId, dataMessage)
 	}
-	return server.sendMessage(player.addr, data)
+	return server.sendMessage(client.addr, data)
 }
 
-func (server *PlanetServer) SendToEveryone(dataMessage *DataMessage) error {
+func (server *UdpServer) SendToEveryone(dataMessage *DataMessage) error {
 	data, err := json.Marshal(dataMessage)
 	if err != nil {
 		return fmt.Errorf("error while parsing data to send: %v", err)
 	}
 
-	for playerId, player := range server.players {
+	for clientId, client := range server.clients {
 		if dataMessage.NeedAck {
-			server.addWaitForAckMessage(playerId, dataMessage)
+			server.addWaitForAckMessage(clientId, dataMessage)
 		}
-		if err := server.sendMessage(player.addr, data); err != nil {
+		if err := server.sendMessage(client.addr, data); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (server *PlanetServer) sendMessage(addr net.Addr, data []byte) error {
+func (server *UdpServer) sendMessage(addr net.Addr, data []byte) error {
 	_, err := server.udpServer.WriteTo(data, addr)
 	if err != nil {
 		return fmt.Errorf("error while sending data to send: %v", err)

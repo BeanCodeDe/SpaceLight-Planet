@@ -4,50 +4,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-func (server *PlanetServer) readIncomingRequests() {
+func (server *UdpServer) readIncomingRequests() {
+	server.logger.Debugf("Start read incoming requests job.")
 	for !server.isClosed {
 		buf := make([]byte, 1024)
 		_, addr, err := server.udpServer.ReadFrom(buf)
 		if err != nil {
-			fmt.Println(err)
+			server.logger.Warnf("Error while reading incoming data: %v", err)
 			continue
 		}
 		server.receiveMessageChan <- &receivedMessage{time: time.Now(), data: buf, sender: addr}
 	}
+	server.logger.Debugf("Stopped read incoming requests job.")
 }
 
-func (server *PlanetServer) processIncomingRequests() {
+func (server *UdpServer) processIncomingRequests() {
+	server.logger.Debugf("Start process incoming requests job.")
 	for !server.isClosed {
 		receivedMessage := <-server.receiveMessageChan
 		dataMessage := &DataMessage{}
 		if err := json.Unmarshal(receivedMessage.data, dataMessage); err != nil {
-			fmt.Println(err)
+			server.logger.Warnf("Error while parsing incoming data: %v", err)
 			continue
 		}
 
 		if _, exists := server.receivedMessageIds[dataMessage.Id]; exists {
-			fmt.Printf("Message already recived: %v", dataMessage.Id)
+			server.logger.Infof("Message already recived: %v", dataMessage.Id)
 			continue
 		}
 
 		if err := server.validateLag(dataMessage.SendTime, receivedMessage.time); err != nil {
-			fmt.Printf("Error while validating lag: %v", err)
+			server.logger.Warnf("Error while validating lag: %v", err)
 			continue
 		}
 
-		if err := server.validateToken(dataMessage.PlayerId, dataMessage.Token); err != nil {
-			fmt.Printf("Error while validating token: %v", err)
-			continue
-		}
 		server.receivedMessageIds[dataMessage.Id] = time.Now()
-		if _, exists := server.players[dataMessage.PlayerId]; !exists {
-			server.playerConnectHandler <- dataMessage.PlayerId
+		if _, exists := server.clients[dataMessage.ClientId]; !exists {
+			server.clientConnectHandler <- dataMessage.ClientId
 		}
-		server.players[dataMessage.PlayerId] = &player{addr: receivedMessage.sender, lastReceivedMessage: time.Now()}
+		server.clients[dataMessage.ClientId] = &client{addr: receivedMessage.sender, lastReceivedMessage: time.Now()}
 
 		if dataMessage.NeedAck {
 			server.ackData.ackHandlerChan <- dataMessage
@@ -55,16 +52,16 @@ func (server *PlanetServer) processIncomingRequests() {
 
 		handler, exists := server.messageHandler[dataMessage.Topic]
 		if !exists {
-			fmt.Printf("no handler for topic %s was found", dataMessage.Topic)
+			server.logger.Warnf("no handler for topic %s was found", dataMessage.Topic)
 			continue
 		}
 
 		handler <- dataMessage
 	}
-
+	server.logger.Debugf("Stopped process incoming requests job.")
 }
 
-func (server *PlanetServer) validateLag(sendTime time.Time, receiveTime time.Time) error {
+func (server *UdpServer) validateLag(sendTime time.Time, receiveTime time.Time) error {
 	durationProcess := receiveTime.Sub(sendTime)
 	if durationProcess.Milliseconds() > lag_process_time {
 		return fmt.Errorf("server is lagging: %v", durationProcess.Microseconds())
@@ -77,23 +74,21 @@ func (server *PlanetServer) validateLag(sendTime time.Time, receiveTime time.Tim
 	return nil
 }
 
-func (server *PlanetServer) validateToken(playerId uuid.UUID, token string) error {
-	return nil
-}
-
-func (server *PlanetServer) checkInactivePlayer() {
+func (server *UdpServer) checkInactiveClient() {
+	server.logger.Debugf("Start check inactive client job.")
 	for !server.isClosed {
 		currentTime := time.Now()
-		for index, player := range server.players {
-			lastMessageDuration := currentTime.Sub(player.lastReceivedMessage)
-			if lastMessageDuration.Milliseconds() > leave_player {
-				server.playerLeaveHandler <- index
-				fmt.Printf("Player %v didn't send message since %dms and will be deleted", index, lastMessageDuration.Milliseconds())
-				delete(server.players, index)
-			} else if lastMessageDuration.Milliseconds() > lag_player {
-				server.playerLagHandler <- index
-				fmt.Printf("Player %v didn't send message since %dms and is lagging", index, lastMessageDuration.Milliseconds())
+		for index, client := range server.clients {
+			lastMessageDuration := currentTime.Sub(client.lastReceivedMessage)
+			if lastMessageDuration.Milliseconds() > leave_client {
+				server.clientLeaveHandler <- index
+				server.logger.Infof("Client %v didn't send message since %dms and will be deleted", index, lastMessageDuration.Milliseconds())
+				delete(server.clients, index)
+			} else if lastMessageDuration.Milliseconds() > lag_client {
+				server.clientLagHandler <- index
+				server.logger.Infof("Client %v didn't send message since %dms and is lagging", index, lastMessageDuration.Milliseconds())
 			}
 		}
 	}
+	server.logger.Debugf("Stopped check inactive client job.")
 }

@@ -11,8 +11,8 @@ import (
 const (
 	lag_process_time = 200
 	lag_receive_time = 1000
-	leave_player     = 5000
-	lag_player       = 1000
+	leave_client     = 5000
+	lag_client       = 1000
 )
 
 type (
@@ -20,44 +20,47 @@ type (
 		HandleMessage(*DataMessage)
 	}
 
-	PlayerEventHandler interface {
+	ClientEventHandler interface {
 		HandleEvent(uuid.UUID)
 	}
 
 	Server interface {
+		SetLogger(logger Logger)
 		StartServer()
 		CloseServer()
 		AddHandler(topic string, handler Handler)
-		SetPlayerConnectHandler(handler PlayerEventHandler)
-		SetPlayerLagHandler(handler PlayerEventHandler)
-		SetPlayerLeaveHandler(handler PlayerEventHandler)
+		SetClientConnectHandler(handler ClientEventHandler)
+		SetClientLagHandler(handler ClientEventHandler)
+		SetClientLeaveHandler(handler ClientEventHandler)
 		SendToEveryone(dataMessage *DataMessage) error
-		SendToPlayer(playerId uuid.UUID, dataMessage *DataMessage) error
+		SendToClient(clientId uuid.UUID, dataMessage *DataMessage) error
 	}
 
-	PlanetServer struct {
+	UdpServer struct {
 		isClosed             bool
 		udpServer            net.PacketConn
-		playerConnectHandler chan uuid.UUID
-		playerLagHandler     chan uuid.UUID
-		playerLeaveHandler   chan uuid.UUID
+		clientConnectHandler chan uuid.UUID
+		clientLagHandler     chan uuid.UUID
+		clientLeaveHandler   chan uuid.UUID
 		messageHandler       map[string]chan *DataMessage
-		players              map[uuid.UUID]*player
+		clients              map[uuid.UUID]*client
 
 		receiveMessageChan chan *receivedMessage
 		receivedMessageIds map[uuid.UUID]time.Time
 
 		ackData *ackData
+
+		logger Logger
 	}
 
 	sendMessage struct {
-		sendToPlayer uuid.UUID
+		sendToClient uuid.UUID
 		lastRetry    time.Time
 		retries      int
 		dataMessage  *DataMessage
 	}
 
-	player struct {
+	client struct {
 		lastReceivedMessage time.Time
 		addr                net.Addr
 	}
@@ -72,56 +75,66 @@ type (
 		Id       uuid.UUID              `json:"id"`
 		SendTime time.Time              `json:"send_time"`
 		NeedAck  bool                   `json:"need_ack"`
-		PlayerId uuid.UUID              `json:"player_id"`
-		Token    string                 `json:"token"`
+		ClientId uuid.UUID              `json:"client_id"`
 		Topic    string                 `json:"topic"`
 		Data     map[string]interface{} `json:"data"`
 	}
 )
 
-func NewServer() (Server, error) {
-	udpServer, err := net.ListenPacket("udp", ":1053")
+func NewServer(addr string) (Server, error) {
+	udpServer, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("an error aaccourd while creating udp server: %v", err)
 	}
-	server := &PlanetServer{
+	server := &UdpServer{
 		isClosed:             false,
 		udpServer:            udpServer,
-		playerConnectHandler: make(chan uuid.UUID),
-		playerLagHandler:     make(chan uuid.UUID),
-		playerLeaveHandler:   make(chan uuid.UUID),
+		clientConnectHandler: make(chan uuid.UUID),
+		clientLagHandler:     make(chan uuid.UUID),
+		clientLeaveHandler:   make(chan uuid.UUID),
 		messageHandler:       make(map[string]chan *DataMessage),
-		players:              make(map[uuid.UUID]*player),
+		clients:              make(map[uuid.UUID]*client),
 
 		receiveMessageChan: make(chan *receivedMessage),
 		receivedMessageIds: make(map[uuid.UUID]time.Time),
 
 		ackData: newAckData(),
+
+		logger: &nilLogger{},
 	}
 	return server, nil
 }
 
-func (server *PlanetServer) StartServer() {
-	go server.startCleanUpChache()
+func (server *UdpServer) SetLogger(logger Logger) {
+	logger.Debugf("Set logger")
+	server.logger = logger
+}
+
+func (server *UdpServer) StartServer() {
+	server.logger.Debugf("Start server")
+	go server.startCleanUpCache()
 	go server.startAckHandle()
 	go server.startAckWatcher()
-	go server.checkInactivePlayer()
+	go server.checkInactiveClient()
 	go server.processIncomingRequests()
 	go server.readIncomingRequests()
 }
 
-func (server *PlanetServer) CloseServer() {
+func (server *UdpServer) CloseServer() {
+	server.logger.Debugf("Close server")
 	server.udpServer.Close()
 }
 
-func (server *PlanetServer) AddHandler(topic string, handler Handler) {
+func (server *UdpServer) AddHandler(topic string, handler Handler) {
+	server.logger.Debugf("Add handler for topic %s", topic)
 	dataMessageChan := make(chan *DataMessage)
 	server.messageHandler[topic] = dataMessageChan
 	server.startHandler(dataMessageChan, handler)
 
 }
 
-func (server *PlanetServer) startHandler(dataMessageChan chan *DataMessage, handler Handler) {
+func (server *UdpServer) startHandler(dataMessageChan chan *DataMessage, handler Handler) {
+	server.logger.Debugf("Start handler")
 	go func() {
 		for !server.isClosed {
 			data := <-dataMessageChan
@@ -130,35 +143,41 @@ func (server *PlanetServer) startHandler(dataMessageChan chan *DataMessage, hand
 	}()
 }
 
-func (server *PlanetServer) SetPlayerConnectHandler(handler PlayerEventHandler) {
-	server.startPlayerEventHandler(server.playerConnectHandler, handler)
+func (server *UdpServer) SetClientConnectHandler(handler ClientEventHandler) {
+	server.logger.Debugf("Set client connect handler")
+	server.startClientEventHandler(server.clientConnectHandler, handler)
 }
-func (server *PlanetServer) SetPlayerLagHandler(handler PlayerEventHandler) {
-	server.startPlayerEventHandler(server.playerLagHandler, handler)
+func (server *UdpServer) SetClientLagHandler(handler ClientEventHandler) {
+	server.logger.Debugf("Set client lag handler")
+	server.startClientEventHandler(server.clientLagHandler, handler)
 }
-func (server *PlanetServer) SetPlayerLeaveHandler(handler PlayerEventHandler) {
-	server.startPlayerEventHandler(server.playerLeaveHandler, handler)
+func (server *UdpServer) SetClientLeaveHandler(handler ClientEventHandler) {
+	server.logger.Debugf("Set client leave handler")
+	server.startClientEventHandler(server.clientLeaveHandler, handler)
 }
 
-func (server *PlanetServer) startPlayerEventHandler(playerIdChan chan uuid.UUID, handler PlayerEventHandler) {
+func (server *UdpServer) startClientEventHandler(clientIdChan chan uuid.UUID, handler ClientEventHandler) {
+	server.logger.Debugf("Start client event handler")
 	go func() {
 		for !server.isClosed {
-			playerId := <-playerIdChan
-			handler.HandleEvent(playerId)
+			clientId := <-clientIdChan
+			handler.HandleEvent(clientId)
 		}
 	}()
 }
 
-func (server *PlanetServer) startCleanUpChache() {
+func (server *UdpServer) startCleanUpCache() {
+	server.logger.Debugf("Start clean up cache job")
 	for !server.isClosed {
 		time.Sleep(1 * time.Minute)
 		toDeleteList := make([]uuid.UUID, 0)
 		now := time.Now()
 		for index, time := range server.receivedMessageIds {
-			if now.Sub(time).Seconds() > leave_player {
+			if now.Sub(time).Seconds() > leave_client {
 				toDeleteList = append(toDeleteList, index)
 			}
 		}
+		server.logger.Debugf("Delete %d old messages from cache.", len(toDeleteList))
 		for _, toDelete := range toDeleteList {
 			delete(server.receivedMessageIds, toDelete)
 		}

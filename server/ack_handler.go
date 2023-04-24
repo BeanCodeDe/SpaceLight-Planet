@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
@@ -11,13 +10,13 @@ import (
 
 const (
 	topic_ack     = "ACK"
-	ack_timeout   = 100
+	ack_timeout   = 200
 	ack_max_retry = 3
 )
 
 type (
 	ackHandler struct {
-		server *PlanetServer
+		server *UdpServer
 	}
 
 	ackData struct {
@@ -34,58 +33,61 @@ func newAckData() *ackData {
 	}
 }
 
-func (server *PlanetServer) startAckHandle() {
+func (server *UdpServer) startAckHandle() {
+	server.logger.Debugf("Start ack handler job.")
 	for !server.isClosed {
 		data := <-server.ackData.ackHandlerChan
 		server.ackHandle(data)
 	}
+	server.logger.Debugf("Stopped ack handler job.")
 }
 
-func (server *PlanetServer) ackHandle(dataMessage *DataMessage) {
+func (server *UdpServer) ackHandle(dataMessage *DataMessage) {
 	ackMessage := &DataMessage{
 		Id:       dataMessage.Id,
 		SendTime: time.Now(),
 		NeedAck:  false,
-		PlayerId: dataMessage.PlayerId,
-		Token:    dataMessage.Token,
+		ClientId: dataMessage.ClientId,
 		Topic:    topic_ack,
 		Data:     nil,
 	}
-	server.SendToPlayer(dataMessage.PlayerId, ackMessage)
+	server.SendToClient(dataMessage.ClientId, ackMessage)
 }
 
-func (server *PlanetServer) startAckWatcher() {
+func (server *UdpServer) startAckWatcher() {
+	server.logger.Debugf("Start ack watcher job.")
 	server.AddHandler(topic_ack, &ackHandler{server: server})
 	for !server.isClosed {
 		server.watchAck()
 	}
+	server.logger.Debugf("Stopped ack watcher job.")
 }
 
-func (server *PlanetServer) watchAck() {
+func (server *UdpServer) watchAck() {
 	server.ackData.waitForAckMutex.Lock()
 	defer server.ackData.waitForAckMutex.Unlock()
 	indicesToDelete := make([]int, 0)
 	for index, ackMessage := range server.ackData.waitForAckMessage {
 		now := time.Now()
 		if now.Sub(ackMessage.lastRetry).Microseconds() > ack_timeout {
-			playerId := ackMessage.sendToPlayer
+			clientId := ackMessage.sendToClient
 			if ackMessage.retries == ack_max_retry {
-				server.playerLeaveHandler <- playerId
+				server.clientLeaveHandler <- clientId
 				indicesToDelete = append(indicesToDelete, index)
 				continue
 			}
-			server.playerLagHandler <- playerId
-			player := server.players[ackMessage.sendToPlayer]
-			if player == nil {
-				fmt.Printf("player [%v] not found\n", ackMessage.sendToPlayer)
+			server.clientLagHandler <- clientId
+			client := server.clients[ackMessage.sendToClient]
+			if client == nil {
+				server.logger.Warnf("client [%v] not found", ackMessage.sendToClient)
 				indicesToDelete = append(indicesToDelete, index)
 				continue
 			}
 			data, err := json.Marshal(ackMessage.dataMessage)
 			if err != nil {
-				fmt.Printf("error while parsing data to send: %v\n", err)
+				server.logger.Warnf("error while parsing data to send: %v\n", err)
 			}
-			server.sendMessage(player.addr, data)
+			server.sendMessage(client.addr, data)
 			ackMessage.lastRetry = time.Now()
 			ackMessage.retries = ackMessage.retries + 1
 		}
@@ -104,11 +106,11 @@ func (handler *ackHandler) HandleMessage(dataMessage *DataMessage) {
 	}
 }
 
-func (server *PlanetServer) addWaitForAckMessage(playerId uuid.UUID, dataMessage *DataMessage) {
+func (server *UdpServer) addWaitForAckMessage(clientId uuid.UUID, dataMessage *DataMessage) {
 	server.ackData.waitForAckMutex.Lock()
 	defer server.ackData.waitForAckMutex.Unlock()
 	message := &sendMessage{
-		sendToPlayer: playerId,
+		sendToClient: clientId,
 		dataMessage:  dataMessage,
 		lastRetry:    dataMessage.SendTime,
 		retries:      0,
