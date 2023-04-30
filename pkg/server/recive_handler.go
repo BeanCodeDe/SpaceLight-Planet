@@ -6,23 +6,24 @@ import (
 	"time"
 )
 
-func (server *UdpServer) readIncomingRequests() {
+func (server *UdpServer) readIncomingRequests(closedChan chan bool) {
 	server.logger.Debugf("Start read incoming requests job.")
-	for !server.isClosed {
+	for !isClosed(closedChan, 1*time.Nanosecond) {
 		buf := make([]byte, 1024)
-		_, addr, err := server.udpServer.ReadFrom(buf)
+		readSize, addr, err := server.udpServer.ReadFrom(buf)
 		if err != nil {
 			server.logger.Warnf("Error while reading incoming data: %v", err)
 			continue
 		}
-		server.receiveMessageChan <- &receivedMessage{time: time.Now(), data: buf, sender: addr}
+		trimedBuffer := buf[:readSize]
+		server.receiveMessageChan <- &receivedMessage{time: time.Now(), data: trimedBuffer, sender: addr}
 	}
 	server.logger.Debugf("Stopped read incoming requests job.")
 }
 
-func (server *UdpServer) processIncomingRequests() {
+func (server *UdpServer) processIncomingRequests(closedChan chan bool) {
 	server.logger.Debugf("Start process incoming requests job.")
-	for !server.isClosed {
+	for !isClosed(closedChan, 1*time.Nanosecond) {
 		receivedMessage := <-server.receiveMessageChan
 		dataMessage := &DataMessage{}
 		if err := json.Unmarshal(receivedMessage.data, dataMessage); err != nil {
@@ -64,19 +65,19 @@ func (server *UdpServer) processIncomingRequests() {
 func (server *UdpServer) validateLag(sendTime time.Time, receiveTime time.Time) error {
 	durationProcess := receiveTime.Sub(sendTime)
 	if durationProcess.Milliseconds() > lag_process_time {
-		return fmt.Errorf("server is lagging: %v", durationProcess.Microseconds())
+		return fmt.Errorf("server is lagging: %vms", durationProcess.Microseconds())
 	}
 	currentTime := time.Now()
 	durationReceive := currentTime.Sub(sendTime)
 	if durationReceive.Milliseconds() > lag_receive_time {
-		return fmt.Errorf("client is lagging: %v", durationReceive.Microseconds())
+		return fmt.Errorf("client is lagging: %vms", durationReceive.Microseconds())
 	}
 	return nil
 }
 
-func (server *UdpServer) checkInactiveClient() {
+func (server *UdpServer) checkInactiveClient(closedChan chan bool) {
 	server.logger.Debugf("Start check inactive client job.")
-	for !server.isClosed {
+	for !isClosed(closedChan, 250*time.Millisecond) {
 		currentTime := time.Now()
 		for index, client := range server.clients {
 			lastMessageDuration := currentTime.Sub(client.lastReceivedMessage)

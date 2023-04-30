@@ -9,9 +9,10 @@ import (
 )
 
 const (
-	topic_ack     = "ACK"
-	ack_timeout   = 200
-	ack_max_retry = 3
+	topic_ack          = "ACK"
+	ack_timeout        = 200
+	ack_max_retry      = 3
+	ack_handler_buffer = 10
 )
 
 type (
@@ -28,14 +29,14 @@ type (
 
 func newAckData() *ackData {
 	return &ackData{
-		ackHandlerChan:    make(chan *DataMessage),
+		ackHandlerChan:    make(chan *DataMessage, ack_handler_buffer),
 		waitForAckMessage: make([]*sendMessage, 0),
 	}
 }
 
-func (server *UdpServer) startAckHandle() {
+func (server *UdpServer) startAckHandle(closedChan chan bool) {
 	server.logger.Debugf("Start ack handler job.")
-	for !server.isClosed {
+	for !isClosed(closedChan, 1*time.Nanosecond) {
 		data := <-server.ackData.ackHandlerChan
 		server.ackHandle(data)
 	}
@@ -54,10 +55,10 @@ func (server *UdpServer) ackHandle(dataMessage *DataMessage) {
 	server.SendToClient(dataMessage.ClientId, ackMessage)
 }
 
-func (server *UdpServer) startAckWatcher() {
+func (server *UdpServer) startAckWatcher(closedChan chan bool) {
 	server.logger.Debugf("Start ack watcher job.")
 	server.AddHandler(topic_ack, &ackHandler{server: server})
-	for !server.isClosed {
+	for !isClosed(closedChan, 1*time.Nanosecond) {
 		server.watchAck()
 	}
 	server.logger.Debugf("Stopped ack watcher job.")

@@ -9,10 +9,15 @@ import (
 )
 
 const (
-	lag_process_time = 200
-	lag_receive_time = 1000
-	leave_client     = 5000
-	lag_client       = 1000
+	lag_process_time              = 200
+	lag_receive_time              = 1000
+	leave_client                  = 3000
+	lag_client                    = 500
+	client_connect_handler_buffer = 10
+	client_lag_handler_buffer     = 10
+	client_leave_handler_buffer   = 10
+	message_handler_buffer        = 10
+	receive_message_buffer        = 10
 )
 
 type (
@@ -37,7 +42,7 @@ type (
 	}
 
 	UdpServer struct {
-		isClosed             bool
+		closeChanList        []chan bool
 		udpServer            net.PacketConn
 		clientConnectHandler chan uuid.UUID
 		clientLagHandler     chan uuid.UUID
@@ -87,15 +92,15 @@ func NewServer(addr string) (Server, error) {
 		return nil, fmt.Errorf("an error aaccourd while creating udp server: %v", err)
 	}
 	server := &UdpServer{
-		isClosed:             false,
+		closeChanList:        make([]chan bool, 0),
 		udpServer:            udpServer,
-		clientConnectHandler: make(chan uuid.UUID),
-		clientLagHandler:     make(chan uuid.UUID),
-		clientLeaveHandler:   make(chan uuid.UUID),
+		clientConnectHandler: make(chan uuid.UUID, client_connect_handler_buffer),
+		clientLagHandler:     make(chan uuid.UUID, client_lag_handler_buffer),
+		clientLeaveHandler:   make(chan uuid.UUID, client_leave_handler_buffer),
 		messageHandler:       make(map[string]chan *DataMessage),
 		clients:              make(map[uuid.UUID]*client),
 
-		receiveMessageChan: make(chan *receivedMessage),
+		receiveMessageChan: make(chan *receivedMessage, receive_message_buffer),
 		receivedMessageIds: make(map[uuid.UUID]time.Time),
 
 		ackData: newAckData(),
@@ -112,22 +117,31 @@ func (server *UdpServer) SetLogger(logger Logger) {
 
 func (server *UdpServer) StartServer() {
 	server.logger.Debugf("Start server")
-	go server.startCleanUpCache()
-	go server.startAckHandle()
-	go server.startAckWatcher()
-	go server.checkInactiveClient()
-	go server.processIncomingRequests()
-	go server.readIncomingRequests()
+	closedCleanUpCacheChan := server.getCloseSignal()
+	go server.startCleanUpCache(closedCleanUpCacheChan)
+	closedAckHandleChan := server.getCloseSignal()
+	go server.startAckHandle(closedAckHandleChan)
+	closedAckWatcherChan := server.getCloseSignal()
+	go server.startAckWatcher(closedAckWatcherChan)
+	closedInactiveClientChan := server.getCloseSignal()
+	go server.checkInactiveClient(closedInactiveClientChan)
+	closedprocessIncomingRequestsChan := server.getCloseSignal()
+	go server.processIncomingRequests(closedprocessIncomingRequestsChan)
+	closedreadIncomingRequestsChan := server.getCloseSignal()
+	go server.readIncomingRequests(closedreadIncomingRequestsChan)
 }
 
 func (server *UdpServer) CloseServer() {
 	server.logger.Debugf("Close server")
+	for _, closeChan := range server.closeChanList {
+		closeChan <- true
+	}
 	server.udpServer.Close()
 }
 
 func (server *UdpServer) AddHandler(topic string, handler Handler) {
 	server.logger.Debugf("Add handler for topic %s", topic)
-	dataMessageChan := make(chan *DataMessage)
+	dataMessageChan := make(chan *DataMessage, message_handler_buffer)
 	server.messageHandler[topic] = dataMessageChan
 	server.startHandler(dataMessageChan, handler)
 
@@ -135,8 +149,9 @@ func (server *UdpServer) AddHandler(topic string, handler Handler) {
 
 func (server *UdpServer) startHandler(dataMessageChan chan *DataMessage, handler Handler) {
 	server.logger.Debugf("Start handler")
+	closedChan := server.getCloseSignal()
 	go func() {
-		for !server.isClosed {
+		for !isClosed(closedChan, 1*time.Nanosecond) {
 			data := <-dataMessageChan
 			handler.HandleMessage(data)
 		}
@@ -158,18 +173,34 @@ func (server *UdpServer) SetClientLeaveHandler(handler ClientEventHandler) {
 
 func (server *UdpServer) startClientEventHandler(clientIdChan chan uuid.UUID, handler ClientEventHandler) {
 	server.logger.Debugf("Start client event handler")
+	closedChan := server.getCloseSignal()
 	go func() {
-		for !server.isClosed {
+		for !isClosed(closedChan, 1*time.Nanosecond) {
 			clientId := <-clientIdChan
 			handler.HandleEvent(clientId)
 		}
 	}()
 }
 
-func (server *UdpServer) startCleanUpCache() {
+func (server *UdpServer) getCloseSignal() chan bool {
+	newCloseSignal := make(chan bool)
+	server.closeChanList = append(server.closeChanList, newCloseSignal)
+	return newCloseSignal
+}
+
+func isClosed(closeSignal chan bool, waitTime time.Duration) bool {
+	select {
+	case closed := <-closeSignal:
+		return closed
+	case <-time.After(waitTime):
+		return false
+	}
+}
+
+func (server *UdpServer) startCleanUpCache(closedChan chan bool) {
 	server.logger.Debugf("Start clean up cache job")
-	for !server.isClosed {
-		time.Sleep(1 * time.Minute)
+
+	for !isClosed(closedChan, 1*time.Minute) {
 		toDeleteList := make([]uuid.UUID, 0)
 		now := time.Now()
 		for index, time := range server.receivedMessageIds {
